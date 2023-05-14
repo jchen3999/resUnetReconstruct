@@ -1,8 +1,8 @@
 device_idx=${1:-0}
-epochs=1000
-batch_size=128
-lr=0.0002
-weight_decay=0.0002
+epochs=400
+batch_size=256
+lr=0.0001
+weight_decay=0.0001
 
 echo use_device:${device_idx}
 

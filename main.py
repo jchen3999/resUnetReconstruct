@@ -14,9 +14,10 @@ import wandb
 import torch.backends.cudnn as cudnn
 import torchvision.datasets as datasets
 import torchvision.transforms as transforms
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 from model_AE import *
-from dataset import Transform,Transform_noaug, zcaTransformation, addGaussianNoise
+from dataset import Transform,Transform_noaug, zcaTransformation,addZeroPadding,addPiexlZeroPadding
 from utils import AverageMeter
 
 from PIL import Image
@@ -29,19 +30,21 @@ parser.add_argument('--arch', metavar='ARCH', default='resnet18')
 parser.add_argument('--save_dir', type=str, default='./experiments/testing/')
 parser.add_argument('--workers', type=int, metavar='N', default=8)
 parser.add_argument('--print_freq', type=int, default=10)
-parser.add_argument('--checkpoint_freq', type=int, default=10)
+parser.add_argument('--checkpoint_freq', type=int, default=19)
 
 # Training variables
-parser.add_argument('--epochs', type=int, metavar='N', default=1000)#100
-parser.add_argument('--batch_size', type=int, metavar='N', default=128) # 1024
+parser.add_argument('--epochs', type=int, metavar='N', default=400)#100
+parser.add_argument('--batch_size', type=int, metavar='N', default=512) # 1024
 parser.add_argument('--lr', type=float, default=0.001)
 parser.add_argument('--weight_decay', type=float, metavar='W', default=0.001)
 parser.add_argument('--stop_epoch', type=int, default=None)
 parser.add_argument('--no_aug', action='store_true')
 
 parser.add_argument('--noise', action='store_true', help='add noise to input images')
-parser.add_argument('--noise_std', type=float, default=0.1, help='std of noise added to input images')
+parser.add_argument('--noise_rgb', action='store_true', help='zero padding at R/G/B instaed of pixel (R+G+B)')
+parser.add_argument('--noise_prob', type=float, default=0.4, help='prob of pixel been zero padding')
 parser.add_argument('--ZCA', action='store_true', help='apply ZCA whitening')
+parser.add_argument('--batch_level_zca', action='store_true', help='apply ZCA at batch level')
 
 # SEED
 parser.add_argument('--seed', default=0, type=int,
@@ -56,7 +59,9 @@ parser.add_argument('--gpu', default=0, type=int,
 
 def main():
     args = parser.parse_args()
-    run_name = f"denoise@{args.noise}_ZCA@{args.ZCA}_batch@{args.batch_size}_lr@{args.lr}_epoch@{args.epochs}_noiseSTD@{args.noise_std}"
+    run_name = f"denoise@{args.noise}_ZCA@{args.ZCA}_batch@{args.batch_size}_lr@{args.lr}_" \
+               f"epoch@{args.epochs}_noiseProb@{args.noise_prob}_scheduler@Ture" \
+               f"_noise@{'rgb' if args.noise_rgb else 'pixel'}_batch_level_zca@{args.batch_level_zca}"
     experiment = wandb.init(project='resUnetReconstruct', resume='allow', anonymous='must',
                             name=run_name)
     experiment.config.update(
@@ -67,7 +72,8 @@ def main():
             lr = args.lr,
             weight_decay = args.weight_decay,
             noise = args.noise,
-            noise_std = args.noise_std,
+            noise_type = 'rgb' if args.noise_rgb else 'pixel',
+            noise_prob = args.noise_prob,
             ZCA = args.ZCA,
             seed = args.seed,
             )
@@ -92,9 +98,11 @@ def main():
                       'from checkpoints.')
     main_worker(args)
         
-        
+
+
 def main_worker(args):
     start_time_all = time.time()
+    global_step = 0
 
     print('\nUsing Single GPU training')
     print('Use GPU: {} for training'.format(args.gpu))
@@ -122,6 +130,7 @@ def main_worker(args):
     model = model.cuda(args.gpu)
     optimizer = torch.optim.AdamW(model.parameters(), args.lr, 
                                 weight_decay=args.weight_decay)
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=10)
     
     print('\nStart training...')
     start_epoch=0
@@ -130,12 +139,13 @@ def main_worker(args):
         start_time_epoch = time.time()
 
         # train the network
-        epoch_loss = train(
+        epoch_loss, global_step = train(
             train_loader,
             model,
             optimizer,
             epoch,
             args,
+            global_step,
         )
         all_losses.append(epoch_loss)
 
@@ -149,7 +159,7 @@ def main_worker(args):
         kernels = kernels - kernels.min()
         kernels = kernels / kernels.max()
         kernel_visualization = torchvision.utils.make_grid(kernels, nrow=16, pad_value=1)
-
+        scheduler.step(epoch_val_loss)
         wandb.log(
             {
                 'train loss': epoch_loss,
@@ -163,10 +173,10 @@ def main_worker(args):
         # TODO: resume this after finding the best hyper-par;
         #  I don't have enough quota
         # # save checkpoints and encoder
-        try:
-            save_checkpoints_encoder(model, optimizer, epoch, args)
-        except:
-            pass
+        # try:
+        #     save_checkpoints_encoder(model, optimizer, epoch, args)
+        # except:
+        #     pass
 
          # save losses
         np.save(os.path.join(args.save_dir, "losses.npy"), np.array(all_losses))
@@ -183,7 +193,7 @@ def main_worker(args):
     print("Total training time: {:.2f} minutes".format((end_time_all - start_time_all) / 60))
 
 
-def train(loader, model, optimizer, epoch, args):
+def train(loader, model, optimizer, epoch, args,global_step):
     batch_time = AverageMeter()
     data_time = AverageMeter()
     losses = AverageMeter()
@@ -191,23 +201,26 @@ def train(loader, model, optimizer, epoch, args):
     # switch to train mode
     model.train()
     criterion = nn.MSELoss().cuda(args.gpu)
+    make_noise = addZeroPadding if args.noise_rgb else addPiexlZeroPadding
+
 
     end = time.time()
     for it, (inputs, labels) in enumerate(loader):
+
         # measure data loading time
         data_time.update(time.time() - end)
 
         inputs = inputs.cuda(args.gpu, non_blocking=True) # used for cal loss
         if args.ZCA:
             if args.noise:
-                inputs_ = addGaussianNoise(inputs,args)
+                inputs_ = make_noise(inputs,args)
                 inputs_ = zcaTransformation(inputs_,args)
                 output = model(inputs_)
             else:
                 inputs_ = zcaTransformation(inputs, args)
                 output = model(inputs_)
         elif args.noise:
-            inputs_ = addGaussianNoise(inputs,args)
+            inputs_ = make_noise(inputs,args)
             output = model(inputs_)
         else:
             output = model(inputs)
@@ -216,6 +229,11 @@ def train(loader, model, optimizer, epoch, args):
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
+        global_step += 1
+        try:
+            save_checkpoints_encoder(model, optimizer, epoch, args, global_step)
+        except:
+            pass
 
         # misc
         losses.update(loss.item(), inputs.size(0))
@@ -236,7 +254,7 @@ def train(loader, model, optimizer, epoch, args):
                     lr=optimizer.param_groups[0]["lr"],
                 )
             )
-    return losses.avg
+    return losses.avg, global_step
 
 
 def validate(val_loader, model, args):
@@ -246,6 +264,7 @@ def validate(val_loader, model, args):
     model.eval()
     criterion = nn.MSELoss()
 
+    make_noise = addZeroPadding if args.noise_rgb else addPiexlZeroPadding
     val_visualization = []
     with torch.no_grad():
         for i, (inputs, labels) in enumerate(val_loader):
@@ -253,14 +272,14 @@ def validate(val_loader, model, args):
             # log zca whitened input
             if args.ZCA:
                 if args.noise:
-                    inputs_ = addGaussianNoise(inputs, args)
-                    inputs_ = zcaTransformation(inputs_, args)
+                    inputs_ = zcaTransformation(inputs, args)
+                    inputs_ = make_noise(inputs_, args)
                     output = model(inputs_)
                 else:
                     inputs_ = zcaTransformation(inputs, args)
                     output = model(inputs_)
             elif args.noise:
-                inputs_ = addGaussianNoise(inputs, args)
+                inputs_ = make_noise(inputs, args)
                 output = model(inputs_)
             else:
                 output = model(inputs)
@@ -296,27 +315,20 @@ class Autoencoder(nn.Module):
         x_hat = self.decoder(r)
         return x_hat
     
-def save_checkpoints_encoder(model, optimizer, epoch, args):
+def save_checkpoints_encoder(model, optimizer, epoch, args,global_step):
     # save autoencoder
-    save_dict = {"epoch": epoch + 1,
-                "state_dict": model.state_dict(),
-                "optimizer": optimizer.state_dict(),}
-    torch.save(save_dict, os.path.join(args.save_dir , "checkpoint.pth"))
-    if (epoch+1) % args.checkpoint_freq == 0 or (epoch+1) == args.epochs or (epoch+1) == args.stop_epoch:
-        shutil.copyfile(
-            os.path.join(args.save_dir, "checkpoint.pth"),
-            os.path.join(args.save_dir_models, "ckp_epoch" + str(epoch+1) + ".pth"))
+    if (global_step+1) % args.checkpoint_freq  == 0:
+        save_dict = {"step": global_step + 1,
+                    "state_dict": model.state_dict()}
+        torch.save(save_dict, os.path.join(args.save_dir_models, "ckp_step_" + str(global_step+1) + ".pth"))
 
-    # save encoder
-    save_dict = {"epoch": epoch + 1,
-                 "state_dict": model.encoder.state_dict()}
-    torch.save(save_dict, os.path.join(args.save_dir , str(args.arch) + ".pth"))
-    if (epoch+1) % args.checkpoint_freq == 0 or (epoch+1) == args.epochs or (epoch+1) == args.stop_epoch:
-        shutil.copyfile(
-            os.path.join(args.save_dir, str(args.arch) + ".pth"),
-            os.path.join(args.save_dir_models, str(args.arch) + "_epoch" + str(epoch+1) + ".pth"))
-        
-    return None
+        # save encoder
+        save_dict = {"step": global_step + 1,
+                     "state_dict": model.encoder.state_dict()}
+        torch.save(save_dict,  os.path.join(args.save_dir_models, str(args.arch) + "_step_" + str(global_step+1) + ".pth"))
+    else:
+        return
+
 
 
 def imgdisp(images, iter, args):

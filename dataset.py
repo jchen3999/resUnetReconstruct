@@ -11,9 +11,23 @@ import torchvision.transforms as transforms
 def addGaussianNoise(x, args):
     return x + torch.randn(x.size()).cuda(args.gpu, non_blocking=True) * args.noise_std
 
+def addZeroPadding(x, args):
+    dummy = (1-args.noise_prob)*torch.ones(x.shape).cuda(args.gpu)
+    bernouilli_noisy_images = x * torch.bernoulli(dummy)
+    return bernouilli_noisy_images
+
+
+def addPiexlZeroPadding(x, args):
+    shape = x.shape
+    dummy = (1-args.noise_prob)*torch.ones(
+        [shape[0], shape[2], shape[3]]
+    ).cuda(args.gpu)
+    bernouilli_noisy_images = x * torch.bernoulli(dummy.unsqueeze(1))
+    return bernouilli_noisy_images
+
 
 class AddGaussianNoise(object):
-    def __init__(self, mean=0., std=0.1):
+    def __init__(self, mean=0., std=0.5):
         self.std = std
         self.mean = mean
 
@@ -121,16 +135,34 @@ class Transform_noaugWithNoise:
         return x1
 
 
-# TODO: not a good practice;
+def zca_whitening_matrix(X):
+    sigma = np.cov(X, rowvar=False)
+    U,S,V = np.linalg.svd(sigma)
+    epsilon = 1e-5
+    ZCAMatrix = np.dot(U, np.dot(np.diag(1.0/np.sqrt(S + epsilon)), U.T))
+    return ZCAMatrix
+
 def zcaTransformation(x,args):
-    transform = transforms.Compose([
-        transforms.LinearTransformation(
-            torch.tensor([[1.6098618, -1.0153007, -0.02540025],
-                          [-1.0153007, 2.5014492, -1.04380666],
-                          [-0.02540025, -1.04380666, 1.52629735]]).cuda(args.gpu, non_blocking=True),
-            torch.tensor([-0.0879, -0.0229, 0.0722]).cuda(args.gpu, non_blocking=True)
-        )
-    ])
+    if args.batch_level_zca:
+        pixels = x.transpose(0, 1).reshape(3, -1).T
+        mean = torch.mean(pixels, dim=0)
+        centered_pixels = pixels - mean
+        pixel_ZCAMatrix = zca_whitening_matrix(centered_pixels.cpu())
+        transform = transforms.Compose([
+            transforms.LinearTransformation(
+                torch.tensor(pixel_ZCAMatrix).float().cuda(args.gpu, non_blocking=True),
+                torch.tensor(mean).cuda(args.gpu, non_blocking=True)
+            )
+        ])
+    else:
+        transform = transforms.Compose([
+            transforms.LinearTransformation(
+                torch.tensor([[1.618706,-1.032769,-0.030614],
+                              [-1.032769,2.531927,-1.043503],
+                              [-0.030614,-1.043503,1.531389]]).cuda(args.gpu, non_blocking=True),
+                torch.tensor([-0.0855, -0.0062,  0.0847]).cuda(args.gpu, non_blocking=True)
+            )
+        ])
     batch_size = x.size()[0]
     zca_x = transform(x.transpose(1, 0).reshape(1, 1, 3, -1).T)
     zca_x = zca_x.T.view(3, batch_size, 224, 224).transpose(1, 0)
