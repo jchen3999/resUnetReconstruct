@@ -1,8 +1,9 @@
 device_idx=${1:-0}
-epochs=400
-batch_size=256
-lr=0.0001
-weight_decay=0.0001
+epochs=300
+batch_size=128
+lr=0.005
+weight_decay=0.01
+noise_prob=${2:-0.4}
 
 echo use_device:${device_idx}
 
@@ -12,4 +13,5 @@ CUDA_VISIBLE_DEVICES=${device_idx} python3 main.py \
 --lr ${lr} \
 --weight_decay ${weight_decay} \
 --noise \
+--noise_prob  ${noise_prob} \
 --ZCA

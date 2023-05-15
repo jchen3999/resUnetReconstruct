@@ -42,6 +42,7 @@ class BasicBlockEnc(nn.Module):
         out = torch.relu(out)
         return out
 
+
 class BasicBlockDec(nn.Module):
 
     def __init__(self, in_planes, stride=1):
@@ -112,7 +113,7 @@ class ResNet18Enc(nn.Module):
         x = self.layer1(x)  # 56x56x64
         x = self.layer2(x)  # 28x28x128                    
         x = self.layer3(x)  # 14x14x256                    
-        x = self.layer4(x)  # 7x7x512                   
+        x = self.layer4(x)  # 7x7x512
         return x
 
 class ResNet18Dec(nn.Module):
